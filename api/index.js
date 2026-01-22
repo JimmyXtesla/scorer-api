@@ -1,6 +1,11 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
+
 require('dotenv').config();
 
 const app = express();
@@ -20,7 +25,27 @@ const pool = mysql.createPool({
     queueLimit: 0
 });
 
-// --- DASHBOARD ENDPOINTS ---
+
+// Check for Auth
+const token = localStorage.getItem('token');
+const user = JSON.parse(localStorage.getItem('user'));
+
+if (!token) {
+    window.location.href = 'auth.html';
+}
+
+// Display user name in the sidebar
+document.addEventListener('DOMContentLoaded', () => {
+    if(user) {
+        document.getElementById('sidebar-username').innerText = user.name;
+    }
+});
+
+// Logout function
+function logout() {
+    localStorage.clear();
+    window.location.href = 'auth.html';
+}
 
 // Get summary stats
 app.get('/api/dashboard/stats', async (req, res) => {

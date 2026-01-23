@@ -16,13 +16,12 @@ const pool = mysql.createPool({
     password: process.env.MYSQL_PASSWORD,
     database: process.env.MYSQL_DATABASE,
     port: process.env.MYSQL_PORT || 3306,
-    ssl: { rejectUnauthorized: true }, // Required for Hostinger/Aiven/Railway
-    waitForConnections: true,
+    ssl: { rejectUnauthorized: true }, 
     connectionLimit: 10,
     queueLimit: 0
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'scoreflow_ultra_secret_88';
+const JWT_SECRET = process.env.JWT_SECRET || 'scor3543546546//76ghgnda76q3jsytsrm,M2Neflow_ultra_secret_88';
 
 // --- SECURITY MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
@@ -137,6 +136,37 @@ app.post('/api/groups', authenticateToken, async (req, res) => {
         res.json({ message: "Group created", groupId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Add/Assign member to group
+app.post('/api/groups/members', authenticateToken, async (req, res) => {
+    const { group_id, user_id } = req.body;
+
+    if (!group_id || !user_id) {
+        return res.status(400).json({ error: "group_id and user_id are required" });
+    }
+
+    try {
+        // Check if user is already in the group to avoid crash
+        const [existing] = await pool.query(
+            'SELECT * FROM group_members WHERE group_id = ? AND user_id = ?', 
+            [group_id, user_id]
+        );
+
+        if (existing.length > 0) {
+            return res.status(400).json({ error: "User is already assigned to this group" });
+        }
+
+        await pool.execute(
+            'INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', 
+            [group_id, user_id]
+        );
+
+        res.json({ message: "Member assigned successfully" });
+    } catch (err) {
+        console.error("Assignment Error:", err);
+        res.status(500).json({ error: "Database error during assignment" });
     }
 });
 

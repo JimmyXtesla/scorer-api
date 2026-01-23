@@ -157,10 +157,41 @@ app.post('/api/groups', authenticateToken, async (req, res) => {
 
 app.post('/api/groups/members', authenticateToken, async (req, res) => {
     const { group_id, user_id } = req.body;
+
+    if (!group_id || !user_id) {
+        return res.status(400).json({ error: "Missing IDs" });
+    }
+
     try {
-        await pool.execute('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [group_id, user_id]);
-        res.json({ message: "Member assigned" });
-    } catch (err) { res.status(400).json({ error: "User already in group or invalid ID" }); }
+        // 1. Delete any existing group membership for this user 
+        // This enforces the "Only One Group" rule
+        await pool.execute('DELETE FROM group_members WHERE user_id = ?', [user_id]);
+
+        // 2. Insert the new group membership
+        await pool.execute(
+            'INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', 
+            [group_id, user_id]
+        );
+
+        res.json({ message: "User moved to the team successfully" });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Database error during reassignment" });
+    }
+});
+
+app.get('/api/groups/:id/members', authenticateToken, async (req, res) => {
+    try {
+        const query = `
+            SELECT u.id, u.name, u.email 
+            FROM users u 
+            JOIN group_members gm ON u.id = gm.user_id 
+            WHERE gm.group_id = ?`;
+        const [rows] = await pool.query(query, [req.params.id]);
+        res.json(rows); // Send back the list of members
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // --- SCORING (EVALUATIONS) ---

@@ -16,12 +16,13 @@ const pool = mysql.createPool({
     password: process.env.MYSQL_PASSWORD,
     database: process.env.MYSQL_DATABASE,
     port: process.env.MYSQL_PORT || 3306,
-    ssl: { rejectUnauthorized: true }, 
+    ssl: { rejectUnauthorized: true },
+    waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'scor3543546546//76ghgnda76q3jsytsrm,M2Neflow_ultra_secret_88';
+const JWT_SECRET = process.env.JWT_SECRET || 'scoreflow_secure_secret_xyz';
 
 // --- SECURITY MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
@@ -30,16 +31,14 @@ const authenticateToken = (req, res, next) => {
 
     if (!token) return res.status(401).json({ error: "Access denied. Token missing." });
 
-    try {
-        const verified = jwt.verify(token, JWT_SECRET);
-        req.user = verified;
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: "Invalid or expired token." });
+        req.user = user;
         next();
-    } catch (err) {
-        res.status(403).json({ error: "Invalid or expired token." });
-    }
+    });
 };
 
-// --- AUTHENTICATION ENDPOINTS ---
+// --- AUTHENTICATION ---
 
 app.post('/api/auth/register', async (req, res) => {
     const { name, email, password, role } = req.body;
@@ -67,110 +66,104 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const token = jwt.sign({ id: user.id, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '24h' });
-        res.json({ token, user: { id: user.id, name: user.name, role: user.role, email: user.email } });
+        res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// --- DASHBOARD ENDPOINTS ---
+// --- ROUND / ROTATION MANAGEMENT ---
+
+app.get('/api/rounds', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM rounds_list ORDER BY created_at DESC');
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/rounds', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: "Admin only" });
+    const { name } = req.body;
+    try {
+        await pool.execute('INSERT INTO rounds_list (name) VALUES (?)', [name]);
+        res.json({ message: "Round created" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/rounds/:id/activate', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: "Admin only" });
+    try {
+        await pool.execute('UPDATE rounds_list SET is_active = FALSE');
+        await pool.execute('UPDATE rounds_list SET is_active = TRUE WHERE id = ?', [req.params.id]);
+        res.json({ message: "Round activated" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- DASHBOARD ---
 
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
+        const [activeRound] = await pool.query('SELECT id, name FROM rounds_list WHERE is_active = TRUE LIMIT 1');
+        const roundId = activeRound[0]?.id || 0;
+
         const [groups] = await pool.query('SELECT COUNT(*) as count FROM groups_list');
-        const [users] = await pool.query('SELECT COUNT(*) as count FROM users');
-        const [avg] = await pool.query('SELECT AVG(average_score) as globalAvg FROM evaluations');
+        const [avg] = await pool.query('SELECT AVG(average_score) as globalAvg FROM evaluations WHERE round_id = ?', [roundId]);
         
         res.json({
+            currentRoundName: activeRound[0]?.name || "None",
             totalGroups: groups[0].count,
-            totalUsers: users[0].count,
             globalAverage: parseFloat(avg[0].globalAvg || 0).toFixed(2)
         });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- USER ENDPOINTS ---
+// --- USER & GROUP MANAGEMENT ---
 
 app.get('/api/users', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT id, name, email, role, created_at FROM users');
         res.json(rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/users/:id', authenticateToken, async (req, res) => {
     try {
         const [user] = await pool.query('SELECT id, name, email, role FROM users WHERE id = ?', [req.params.id]);
         const [history] = await pool.query(`
-            SELECT e.*, g.name as group_name 
+            SELECT e.*, g.name as group_name, r.name as round_name
             FROM evaluations e 
             JOIN groups_list g ON e.group_id = g.id 
+            JOIN rounds_list r ON e.round_id = r.id
             WHERE e.member_id = ? 
             ORDER BY e.created_at DESC`, [req.params.id]);
         res.json({ user: user[0], evaluations: history });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
-// --- GROUP ENDPOINTS ---
 
 app.get('/api/groups', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM groups_list');
         res.json(rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/groups', authenticateToken, async (req, res) => {
-    if (req.user.role === 'MEMBER') return res.status(403).json({ error: "Unauthorized" });
     const { name, description } = req.body;
     try {
         const [result] = await pool.execute('INSERT INTO groups_list (name, description) VALUES (?, ?)', [name, description]);
         res.json({ message: "Group created", groupId: result.insertId });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Add/Assign member to group
 app.post('/api/groups/members', authenticateToken, async (req, res) => {
     const { group_id, user_id } = req.body;
-
-    if (!group_id || !user_id) {
-        return res.status(400).json({ error: "group_id and user_id are required" });
-    }
-
     try {
-        // Check if user is already in the group to avoid crash
-        const [existing] = await pool.query(
-            'SELECT * FROM group_members WHERE group_id = ? AND user_id = ?', 
-            [group_id, user_id]
-        );
-
-        if (existing.length > 0) {
-            return res.status(400).json({ error: "User is already assigned to this group" });
-        }
-
-        await pool.execute(
-            'INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', 
-            [group_id, user_id]
-        );
-
-        res.json({ message: "Member assigned successfully" });
-    } catch (err) {
-        console.error("Assignment Error:", err);
-        res.status(500).json({ error: "Database error during assignment" });
-    }
+        await pool.execute('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [group_id, user_id]);
+        res.json({ message: "Member assigned" });
+    } catch (err) { res.status(400).json({ error: "User already in group or invalid ID" }); }
 });
 
-// --- EVALUATION (SCORING) ENDPOINT ---
+// --- SCORING (EVALUATIONS) ---
 
 app.post('/api/evaluations', authenticateToken, async (req, res) => {
     const { 
@@ -180,46 +173,32 @@ app.post('/api/evaluations', authenticateToken, async (req, res) => {
         strengths, improvements 
     } = req.body;
 
-    const evaluator_id = req.user.id; // Taken from JWT token for security
-
-    // Math: Average of the 8 criteria provided in your image
-    const scores = [
-        s_style ?? 0, s_content ?? 0, s_clarity ?? 0, s_timing ?? 0, 
-        s_wow ?? 0, s_clear_res ?? 0, s_acc_res ?? 0, s_con_res ?? 0
-    ].map(s => parseFloat(s));
-    
-    const sum = scores.reduce((a, b) => a + b, 0);
-    const avg = sum / scores.length;
-
     try {
+        // Find active round
+        const [activeRounds] = await pool.query('SELECT id FROM rounds_list WHERE is_active = TRUE LIMIT 1');
+        if (activeRounds.length === 0) return res.status(400).json({ error: "No active round set by Admin" });
+        const round_id = activeRounds[0].id;
+
+        // Math
+        const scores = [s_style, s_content, s_clarity, s_timing, s_wow, s_clear_res, s_acc_res, s_con_res].map(s => parseFloat(s) || 0);
+        const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+
         const query = `
             INSERT INTO evaluations 
-            (evaluator_id, member_id, group_id, 
+            (evaluator_id, member_id, group_id, round_id, 
              score_slide_style, score_content, score_clarity, score_timing, 
              score_wow_factor, score_clear_response, score_accurate_response, score_conciseness,
              average_score, strengths, improvements) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
         
-        const values = [
-            evaluator_id, member_id, group_id, 
-            ...scores, avg, strengths ?? null, improvements ?? null
-        ];
+        await pool.execute(query, [req.user.id, member_id, group_id, round_id, ...scores, avg, strengths, improvements]);
+        res.json({ message: "Evaluation saved", average: avg.toFixed(2) });
 
-        await pool.execute(query, values);
-        res.json({ message: "Evaluation submitted successfully", average: avg.toFixed(2) });
-    } catch (err) {
-        console.error("Evaluation Error:", err.message);
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- SERVER LIFECYCLE ---
-
-// Local development listener
+// --- EXPORTS ---
 if (process.env.NODE_ENV !== 'production') {
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => console.log(`🚀 Server ready at http://localhost:${PORT}`));
+    app.listen(3000, () => console.log(`Server at http://localhost:3000`));
 }
-
-// Export for Vercel
 module.exports = app;

@@ -3,6 +3,7 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { error } = require('console');
 require('dotenv').config();
 
 const app = express();
@@ -72,6 +73,16 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+
+
+app.get('/api/get_user/:id', async (req, res) =>{
+    try {const [user] = await pool.query('SELECT id, name, email FROM users WHERE id = ?' , [req.params.id]);
+        res.json(user);
+    } catch (err){
+        res.status(500).json({error: err.message});
+    }
+
+});
 // --- ROUND / ROTATION MANAGEMENT ---
 
 app.get('/api/rounds', authenticateToken, async (req, res) => {
@@ -100,7 +111,6 @@ app.patch('/api/rounds/:id/activate', authenticateToken, async (req, res) => {
 });
 
 // --- DASHBOARD ---
-
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
         const [activeRound] = await pool.query('SELECT id, name FROM rounds_list WHERE is_active = TRUE LIMIT 1');

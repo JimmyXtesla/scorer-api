@@ -75,11 +75,12 @@ app.post('/api/auth/login', async (req, res) => {
 
 
 
-app.get('/api/get_user/:id', async (req, res) =>{
-    try {const [user] = await pool.query('SELECT id, name, email FROM users WHERE id = ?' , [req.params.id]);
+app.get('/api/get_user/:id', async (req, res) => {
+    try {
+        const [user] = await pool.query('SELECT id, name, email FROM users WHERE id = ?', [req.params.id]);
         res.json(user);
-    } catch (err){
-        res.status(500).json({error: err.message});
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 
 });
@@ -110,6 +111,27 @@ app.patch('/api/rounds/:id/activate', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// --- SESSION MANAGEMENT ---
+
+app.get('/api/sessions', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM presentation_sessions ORDER BY session_date DESC');
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/sessions', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: "Admin only" });
+    const { round_id, session_date, topic } = req.body;
+    try {
+        const [result] = await pool.execute(
+            'INSERT INTO presentation_sessions (round_id, session_date, topic) VALUES (?, ?, ?)',
+            [round_id, session_date, topic]
+        );
+        res.json({ message: "Monday session created", sessionId: result.insertId });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // --- DASHBOARD ---
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
@@ -118,7 +140,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 
         const [groups] = await pool.query('SELECT COUNT(*) as count FROM groups_list');
         const [avg] = await pool.query('SELECT AVG(average_score) as globalAvg FROM evaluations WHERE round_id = ?', [roundId]);
-        
+
         res.json({
             currentRoundName: activeRound[0]?.name || "None",
             totalGroups: groups[0].count,
@@ -173,13 +195,10 @@ app.post('/api/groups/members', authenticateToken, async (req, res) => {
     }
 
     try {
-        // 1. Delete any existing group membership for this user 
-        // This enforces the "Only One Group" rule
         await pool.execute('DELETE FROM group_members WHERE user_id = ?', [user_id]);
 
-        // 2. Insert the new group membership
         await pool.execute(
-            'INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', 
+            'INSERT INTO group_members (group_id, user_id) VALUES (?, ?)',
             [group_id, user_id]
         );
 
@@ -198,42 +217,87 @@ app.get('/api/groups/:id/members', authenticateToken, async (req, res) => {
             JOIN group_members gm ON u.id = gm.user_id 
             WHERE gm.group_id = ?`;
         const [rows] = await pool.query(query, [req.params.id]);
-        res.json(rows); // Send back the list of members
+        res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
+// --- ADVANCED RANKINGS ---
+
+app.get('/api/rankings/groups', authenticateToken, async (req, res) => {
+    try {
+        const [activeRound] = await pool.query('SELECT id FROM rounds_list WHERE is_active = TRUE LIMIT 1');
+        const roundId = activeRound[0]?.id || 0;
+
+        // Complex JOIN to get group members and their latest scores
+        const query = `
+            SELECT 
+                g.id as groupId, g.name as groupName,
+                MIN(e.total_score) as minScore,
+                MAX(e.total_score) as maxScore,
+                (MAX(e.total_score) - MIN(e.total_score)) as performanceGap,
+                AVG(e.total_score) as groupAvg
+            FROM groups_list g
+            JOIN group_members gm ON g.id = gm.group_id
+            JOIN evaluations e ON gm.user_id = e.member_id
+            WHERE e.round_id = ?
+            GROUP BY g.id
+            ORDER BY minScore DESC`;
+
+        const [rankings] = await pool.query(query, [roundId]);
+        res.json(rankings);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/rankings/members', authenticateToken, async (req, res) => {
+    try {
+        const [activeRound] = await pool.query('SELECT id FROM rounds_list WHERE is_active = TRUE LIMIT 1');
+        const roundId = activeRound[0]?.id || 0;
+
+        const query = `
+            SELECT u.id, u.name, u.role, SUM(e.total_score) as cumulativeScore, COUNT(e.id) as sessionsCount
+            FROM users u
+            JOIN evaluations e ON u.id = e.member_id
+            WHERE e.round_id = ?
+            GROUP BY u.id
+            ORDER BY cumulativeScore DESC
+            LIMIT 10`;
+
+        const [leaderboard] = await pool.query(query, [roundId]);
+        res.json(leaderboard);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // --- SCORING (EVALUATIONS) ---
 
 app.post('/api/evaluations', authenticateToken, async (req, res) => {
-    const { 
-        member_id, group_id, 
-        s_style, s_content, s_clarity, s_timing, 
+    const {
+        member_id, group_id, session_id,
+        s_style, s_content, s_clarity, s_timing,
         s_wow, s_clear_res, s_acc_res, s_con_res,
-        strengths, improvements 
+        strengths, improvements
     } = req.body;
 
     try {
-        // Find active round
         const [activeRounds] = await pool.query('SELECT id FROM rounds_list WHERE is_active = TRUE LIMIT 1');
         if (activeRounds.length === 0) return res.status(400).json({ error: "No active round set by Admin" });
         const round_id = activeRounds[0].id;
 
-        // Math
         const scores = [s_style, s_content, s_clarity, s_timing, s_wow, s_clear_res, s_acc_res, s_con_res].map(s => parseFloat(s) || 0);
-        const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+        const total = scores.reduce((a, b) => a + b, 0);
+        const avg = total / scores.length;
 
         const query = `
             INSERT INTO evaluations 
-            (evaluator_id, member_id, group_id, round_id, 
+            (evaluator_id, member_id, group_id, round_id, session_id,
              score_slide_style, score_content, score_clarity, score_timing, 
              score_wow_factor, score_clear_response, score_accurate_response, score_conciseness,
-             average_score, strengths, improvements) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-        
-        await pool.execute(query, [req.user.id, member_id, group_id, round_id, ...scores, avg, strengths, improvements]);
-        res.json({ message: "Evaluation saved", average: avg.toFixed(2) });
+             average_score, total_score, strengths, improvements) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+        await pool.execute(query, [req.user.id, member_id, group_id, round_id, session_id || null, ...scores, avg, total, strengths, improvements]);
+        res.json({ message: "Evaluation saved", total: total.toFixed(2), average: avg.toFixed(2) });
 
     } catch (err) { res.status(500).json({ error: err.message }); }
 });

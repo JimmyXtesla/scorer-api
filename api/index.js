@@ -141,10 +141,32 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
         const [groups] = await pool.query('SELECT COUNT(*) as count FROM groups_list');
         const [avg] = await pool.query('SELECT AVG(average_score) as globalAvg FROM evaluations WHERE round_id = ?', [roundId]);
 
+        // Trend Chart: Avg Score by Day of Week (0-6)
+        const [trends] = await pool.query(`
+            SELECT WEEKDAY(created_at) as day, AVG(average_score) as avgScore
+            FROM evaluations 
+            WHERE round_id = ? 
+            GROUP BY day 
+            ORDER BY day ASC`, [roundId]
+        );
+        // Map to 7 days
+        const trendData = Array(7).fill(0);
+        trends.forEach(t => trendData[t.day] = parseFloat(t.avgScore).toFixed(1));
+
+        // Sparkline: Last 10 evaluations scores
+        const [spark] = await pool.query('SELECT total_score FROM evaluations WHERE round_id = ? ORDER BY created_at DESC LIMIT 10', [roundId]);
+        const sparklineData = spark.map(s => parseFloat(s.total_score));
+
+        // Total evaluations count for the round
+        const [evalCount] = await pool.query('SELECT COUNT(*) as count FROM evaluations WHERE round_id = ?', [roundId]);
+
         res.json({
             currentRoundName: activeRound[0]?.name || "None",
             totalGroups: groups[0].count,
-            globalAverage: parseFloat(avg[0].globalAvg || 0).toFixed(2)
+            totalEvaluations: evalCount[0].count,
+            globalAverage: parseFloat(avg[0].globalAvg || 0).toFixed(2),
+            trendData,
+            sparklineData: sparklineData.reverse() // Show oldest to newest
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -153,7 +175,12 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 
 app.get('/api/users', authenticateToken, async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT id, name, email, role, created_at FROM users');
+        const query = `
+            SELECT u.id, u.name, u.email, u.role, u.created_at, gm.group_id
+            FROM users u
+            LEFT JOIN group_members gm ON u.id = gm.user_id
+        `;
+        const [rows] = await pool.query(query);
         res.json(rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -169,6 +196,14 @@ app.get('/api/users/:id', authenticateToken, async (req, res) => {
             WHERE e.member_id = ? 
             ORDER BY e.created_at DESC`, [req.params.id]);
         res.json({ user: user[0], evaluations: history });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/groups/:id', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM groups_list WHERE id = ?', [req.params.id]);
+        if (rows.length === 0) return res.status(404).json({ error: "Group not found" });
+        res.json(rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -284,6 +319,16 @@ app.post('/api/evaluations', authenticateToken, async (req, res) => {
         if (activeRounds.length === 0) return res.status(400).json({ error: "No active round set by Admin" });
         const round_id = activeRounds[0].id;
 
+        // Auto-detect session if not provided
+        let finalSessionId = session_id;
+        if (!finalSessionId) {
+            const [recentSession] = await pool.query(
+                'SELECT id FROM presentation_sessions WHERE round_id = ? AND session_date <= CURDATE() ORDER BY session_date DESC LIMIT 1',
+                [round_id]
+            );
+            if (recentSession.length > 0) finalSessionId = recentSession[0].id;
+        }
+
         const scores = [s_style, s_content, s_clarity, s_timing, s_wow, s_clear_res, s_acc_res, s_con_res].map(s => parseFloat(s) || 0);
         const total = scores.reduce((a, b) => a + b, 0);
         const avg = total / scores.length;
@@ -296,7 +341,7 @@ app.post('/api/evaluations', authenticateToken, async (req, res) => {
              average_score, total_score, strengths, improvements) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
-        await pool.execute(query, [req.user.id, member_id, group_id, round_id, session_id || null, ...scores, avg, total, strengths, improvements]);
+        await pool.execute(query, [req.user.id, member_id, group_id, round_id, finalSessionId || null, ...scores, avg, total, strengths, improvements]);
         res.json({ message: "Evaluation saved", total: total.toFixed(2), average: avg.toFixed(2) });
 
     } catch (err) { res.status(500).json({ error: err.message }); }
